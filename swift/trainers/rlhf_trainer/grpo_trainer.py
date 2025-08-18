@@ -1293,6 +1293,11 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # (see _generate_and_score_completions) and use per_token_logps.detach() instead.
         old_per_token_logps = (
             per_token_logps.detach() if inputs['old_per_token_logps'] is None else inputs['old_per_token_logps'])
+        
+        if self.importance_sampling_level == 'implicit_reward':
+            implicit_rewards = per_token_logps[..., -1]  # [batch_size, seq_len]
+            per_token_logps = per_token_logps[..., :-1] # [batch_size, seq_len, vocab_size]
+            old_per_token_logps = old_per_token_logps[..., :-1] # [batch_size, seq_len, vocab_size]
 
         log_ratio = per_token_logps - old_per_token_logps
         if self.importance_sampling_level == 'token':
@@ -1300,7 +1305,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         elif self.importance_sampling_level == 'sequence':
             log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
             log_importance_weights = log_importance_weights.unsqueeze(-1)
-        elif self.importance_sampling_level == 'sequence_token':
+        elif self.importance_sampling_level == 'sequence_token' or self.importance_sampling_level == 'implicit_reward':
             # GSPO-token: sg[si(θ)] * πθ(yi,t)/sg[πθ(yi,t)]
             seq_level_log_weight = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
             seq_level_log_weight = seq_level_log_weight.detach().unsqueeze(-1)  # Stop gradient
