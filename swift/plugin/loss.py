@@ -748,6 +748,102 @@ def listwise_generative_reranker_loss(outputs,
     # Return average loss across all groups
     return total_loss / num_groups
 
+def implicit_reward_loss(outputs,
+                         labels,
+                         loss_scale=None,
+                         num_items_in_batch=None,
+                         trainer=None,
+                         gamma=0.95,  # 折扣因子，可配置
+                         beta=0.02,   # 权重下限，新增超参数
+                         **kwargs) -> torch.Tensor:
+    """
+    Train implicit reward model using MSE loss between computed implicit reward and ground truth reward.
+    Ground truth reward is determined by the last non-ignored token in the labels.
+    Logits have an extra dimension for reward (vocab_size+1).
+    Handles variable-length sequences with padding (ignore_index = -100).
+    Weight factor is max(γ^{|y_i|-t}, β).
+
+    Args:
+        outputs: Model outputs containing logits with shape [batch_size, seq_len, vocab_size+1]
+        labels: Input sequences with shape [batch_size, seq_len], padding uses -100
+        loss_scale: Not used
+        num_items_in_batch: Not used
+        trainer: Trainer instance to access tokenizer
+        gamma: Discount factor for weighting past tokens
+        beta: Minimum weight factor (default 0.1)
+        **kwargs: Additional keyword arguments
+
+    Returns:
+        torch.Tensor: MSE loss between computed implicit reward and ground truth reward
+    """
+    if trainer is None:
+        raise ValueError('trainer is required to access tokenizer')
+
+    tokenizer = trainer.processing_class
+    logits = outputs.logits  # [batch_size, seq_len, vocab_size+1]
+    batch_size, seq_len, vocab_size_plus = logits.shape
+    
+    # 1. 确定真实奖励标签（根据labels的最后一个非忽略token）
+    positive_token = os.environ.get('GENERATIVE_RERANKER_POSITIVE_TOKEN', 'good')
+    negative_token = os.environ.get('GENERATIVE_RERANKER_NEGATIVE_TOKEN', 'bad')
+    
+    try:
+        positive_token_id = tokenizer.convert_tokens_to_ids(positive_token)
+        negative_token_id = tokenizer.convert_tokens_to_ids(negative_token)
+    except Exception as e:
+        raise ValueError(f"Failed to convert tokens '{positive_token}'/'{negative_token}' to IDs. "
+                         f'Please check if these tokens exist in the tokenizer vocabulary. Error: {e}')
+    
+    # 创建mask：忽略-100的位置
+    mask = labels != -100
+    
+    # 找到每个序列的最后一个非忽略位置
+    last_positions = mask.sum(dim=1) - 1  # [batch_size]
+    
+    # 提取每个序列的最后一个非忽略token
+    last_tokens = labels[torch.arange(batch_size), last_positions]  # [batch_size]
+    
+    # 创建真实奖励标签：1 for "good", 0 for "bad"
+    r_gt = torch.where(
+        last_tokens == positive_token_id,
+        torch.ones(batch_size, device=last_tokens.device),
+        torch.zeros(batch_size, device=last_tokens.device)
+    ).float()  # [batch_size]
+    
+    # 2. 计算隐式奖励（按照公式 r_implicit = (1/|y_i|) * Σ γ^{|y_i|-t} * r_{i,t}）
+    
+    # 提取奖励值：logits的最后一个维度是奖励值
+    rewards = logits[..., -1]  # [batch_size, seq_len]
+    
+    # 计算每个序列的实际长度（非忽略位置的数量）
+    seq_lengths = mask.sum(dim=1)  # [batch_size]
+    
+    # 创建时间折扣权重矩阵
+    device = logits.device
+    t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)  # [batch_size, seq_len]
+    
+    # 计算每个位置距离序列末尾的距离
+    distance_to_end = (seq_lengths.unsqueeze(1) - 1) - t_indices  # [batch_size, seq_len]
+    
+    # 计算原始权重γ^{distance_to_end}
+    raw_weights = torch.zeros_like(rewards, dtype=torch.float)
+    valid_mask = mask & (distance_to_end >= 0)  # 只考虑有效位置和有效距离
+    raw_weights[valid_mask] = gamma ** distance_to_end[valid_mask].float()
+    
+    # 应用权重下限：max(γ^{|y_i|-t}, β)
+    weights = torch.maximum(raw_weights, torch.tensor(beta, device=device))
+    
+    # 计算加权奖励
+    weighted_rewards = rewards * weights  # [batch_size, seq_len]
+    sum_weighted = weighted_rewards.sum(dim=1)  # [batch_size]
+    
+    # 计算隐式奖励：加权和除以实际序列长度
+    r_implicit = sum_weighted / seq_lengths.float()  # [batch_size]
+    
+    # 3. 计算MSE损失
+    loss = torch.mean((r_implicit - r_gt) ** 2)
+    
+    return loss
 
 loss_mapping = {
     'channel_loss': channel_loss_func,
@@ -761,6 +857,8 @@ loss_mapping = {
     'generative_reranker': generative_reranker_loss,
     'listwise_reranker': listwise_reranker_loss,
     'listwise_generative_reranker': listwise_generative_reranker_loss,
+
+    'implicit_reward_loss': implicit_reward_loss,
 }
 
 
