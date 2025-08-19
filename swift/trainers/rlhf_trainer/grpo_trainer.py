@@ -1127,9 +1127,14 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         template = self.template
 
+        # Split inputs and rewards data
         gas_chunks, advantage_chunks = self.split_by_mini_batches(inputs, advantages)
+        reward_chunks = self.split_by_mini_batches(inputs, rewards)[1]
+        mean_chunks = self.split_by_mini_batches(inputs, mean_grouped_rewards)[1]
+        std_chunks = self.split_by_mini_batches(inputs, std_grouped_rewards)[1]
+
         ga_batch_encoded_inputs = []
-        for i, (batch, batch_advantages) in enumerate(zip(gas_chunks, advantage_chunks)):
+        for i, (batch, batch_rewards, batch_mean, batch_std, batch_advantages) in enumerate(zip(gas_chunks, reward_chunks, mean_chunks, std_chunks, advantage_chunks)):
             # Encode and process each batch (size=bs)
             with self._template_context(template):
                 batch_encoded_inputs = [template.encode(infer_request) for infer_request in batch]
@@ -1138,6 +1143,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Process labels and masks
             labels = batch_encoded_inputs.pop('labels')
             logits_to_keep = (labels.shape[-1] - (torch.ne(labels, -100).int().argmax(-1))).max().item()
+
+            assert batch_rewards.shape == batch_mean.shape == batch_std.shape == batch_advantages.shape
             batch_encoded_inputs.update({
                 'completion_mask':
                 labels[:, -logits_to_keep:] != -100,
@@ -1146,7 +1153,13 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 'logits_to_keep':
                 logits_to_keep,
                 'advantages':
-                batch_advantages
+                batch_advantages, # Standard advantages
+                'verifier_rewards': 
+                batch_rewards,  # Raw verifier rewards
+                'group_mean': 
+                batch_mean,  # Mean of verifier rewards for this group
+                'group_std': 
+                batch_std,  # Std of verifier rewards for this group
             })
 
             with torch.no_grad():
@@ -1252,8 +1265,12 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         completion_mask = inputs['completion_mask']
         truncated_mask = inputs['truncated_mask']
 
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model, inputs, compute_entropy=self.compute_entropy)
+        if self.importance_sampling_level == 'implicit_reward':
+            per_token_logps, entropies, implicit_rewards = self._get_per_token_logps_and_entropies(
+                model, inputs, compute_entropy=self.compute_entropy)
+        else:
+            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                model, inputs, compute_entropy=self.compute_entropy)
 
         entropy_mask = None
         if self.compute_entropy:
@@ -1287,19 +1304,48 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1)
 
-        advantages = inputs['advantages']
+        advantages = inputs['advantages']  # [batch_size] (standard advantages)
+        verifier_rewards = inputs['verifier_rewards']  # [batch_size] (sequence-level rewards)
+        group_mean = inputs['group_mean']  # [batch_size] (group mean rewards)
+        group_std = inputs['group_std']  # [batch_size] (group std rewards)
+
         # When under on-policy training
         # old_per_token_logps == per_token_logps, so we can skip it's computation
         # (see _generate_and_score_completions) and use per_token_logps.detach() instead.
         old_per_token_logps = (
             per_token_logps.detach() if inputs['old_per_token_logps'] is None else inputs['old_per_token_logps'])
         
+        # implicit_reward.shape = per_token_logps.shape = [B,S]
         if self.importance_sampling_level == 'implicit_reward':
-            implicit_rewards = per_token_logps[..., -1]  # [batch_size, seq_len]
-            per_token_logps = per_token_logps[..., :-1] # [batch_size, seq_len, vocab_size]
-            old_per_token_logps = old_per_token_logps[..., :-1] # [batch_size, seq_len, vocab_size]
+            gamma, eta = 0.95, 0.02
 
-        log_ratio = per_token_logps - old_per_token_logps
+            # 计算序列级隐式奖励 r_implicit(x,y_i) - 公式(3)
+            # 获取序列有效长度 [batch_size]
+            seq_lens = completion_mask.sum(dim=-1).clamp(min=1)
+            
+            # 创建衰减权重矩阵 [batch_size, seq_len]
+            max_len = completion_mask.size(1)
+            exponents = (seq_lens.unsqueeze(1) - 1 - torch.arange(max_len, device=completion_mask.device))
+            decay_weights = torch.max(torch.pow(gamma, exponents), torch.tensor(eta, device=completion_mask.device))
+            decay_weights = decay_weights * completion_mask  # 应用mask
+            
+            # 计算加权平均隐式奖励 [batch_size]
+            r_implicit_seq = (implicit_rewards * decay_weights).sum(dim=-1) / seq_lens
+            
+            # 计算权重 w_i = r_verifier / r_implicit [batch_size]
+            w_i = verifier_rewards / (r_implicit_seq + 1e-8)
+            
+            # 计算新的优势函数 A^GIRPO - 公式(2)
+            weighted_implicit = w_i.unsqueeze(1) * implicit_rewards  # [batch_size, seq_len]
+            per_token_advantages = (weighted_implicit - group_mean) / (group_std + 1e-8)  # [batch_size, seq_len]
+            
+            # 替换原始advantages
+            advantages = per_token_advantages
+            
+            # 计算MSE损失 L_R(θ) - 公式(4)第二部分
+            mse_loss = torch.mean((r_implicit_seq - verifier_rewards) ** 2)
+
+        log_ratio = per_token_logps - old_per_token_logps # [batch, seq_len]
         if self.importance_sampling_level == 'token':
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == 'sequence':
@@ -1317,13 +1363,17 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
         # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
 
+        # 计算PPO损失 [batch_size, seq_len]
         coef_1 = torch.exp(log_importance_weights)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
         if self.args.delta is not None:
             coef_1 = torch.clamp(coef_1, max=self.args.delta)
 
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        if self.importance_sampling_level != 'implicit_reward':
+            advantages = advantages.unsqueeze(1)
+
+        per_token_loss1 = coef_1 * advantages
+        per_token_loss2 = coef_2 * advantages
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
@@ -1338,6 +1388,10 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
+        
+        if self.importance_sampling_level == 'implicit_reward':
+            alpha = 0.7
+            loss = alpha * loss + (1 - alpha) * mse_loss
 
         completion_token_count = completion_mask.sum().clamp(min=1.0)
 
@@ -1352,8 +1406,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self._metrics[mode]['kl'].append(self.accelerator.gather_for_metrics(mean_kl).nanmean().item())
 
         # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
+        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
 
         low_clip = masked_batch_mean(is_low_clipped.float())
@@ -1448,6 +1502,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
     def _get_per_token_logps_and_entropies(self,
                                            model,
                                            inputs,
+                                           implicit_reward=False, # Make the output is full of logits Tensor with shape of [batch,seq_len,vocab]
                                            compute_entropy=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         logits_to_keep = inputs['logits_to_keep']
         input_ids = inputs['input_ids']
@@ -1482,6 +1537,17 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 inputs['logits_to_keep'] = logits_to_keep + 1
             with self._template_context(self.template), self.padding_free_context(model):
                 logits = model(**inputs).logits
+
+            # 在 _get_per_token_logps_and_entropies 方法中
+            if self.importance_sampling_level == 'implicit_reward':
+                # 确保有足够的维度来处理隐式奖励
+                if logits.dim() != 3:
+                    raise ValueError(f"Expected 3D logits for implicit_reward mode, got {logits.dim()}D")
+                
+                # 分离隐式奖励和词汇表 logits
+                implicit_rewards = logits[..., -1]
+                logits = logits[..., :-1]
+            
             # exclude the last logit: it corresponds to the next token pred
             logits = logits[:, -(logits_to_keep + 1):-1, :]
             logits = logits / self.temperature
@@ -1490,7 +1556,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             entropies = None
             if compute_entropy:
                 entropies = entropy_from_logits(logits)
-
+        if implicit_reward:
+            return logps, entropies, implicit_rewards
         return logps, entropies
 
     @patch_profiling_decorator
