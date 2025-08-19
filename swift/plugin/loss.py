@@ -862,6 +862,27 @@ def implicit_reward_loss(outputs,
     
     return loss
 
+def mix_ce_ir_loss(outputs,
+                         labels,
+                         loss_scale=None,
+                         num_items_in_batch=None,
+                         trainer=None,
+                         gamma=0.95,  # 折扣因子，可配置
+                         beta=0.02,   # 权重下限，新增超参数
+                         mix_eta=0.5,
+                         **kwargs) -> torch.Tensor:
+    ir_loss = implicit_reward_loss(
+        outputs,
+        labels,
+        loss_scale,
+        num_items_in_batch,
+        trainer,
+        gamma=0.95,  # 折扣因子，可配置
+        beta=0.02,   # 权重下限，新增超参数
+    )
+    ce_loss = per_token_loss_func(outputs, labels)
+    return mix_eta * ir_loss + (1 - mix_eta) * ce_loss
+
 loss_mapping = {
     'per_token_cross_entropy': per_token_loss_func,
     'channel_loss': channel_loss_func,
@@ -875,6 +896,8 @@ loss_mapping = {
     'generative_reranker': generative_reranker_loss,
     'listwise_reranker': listwise_reranker_loss,
     'listwise_generative_reranker': listwise_generative_reranker_loss,
+
+    'implicit_reward_loss': implicit_reward_loss
 }
 
 
