@@ -820,6 +820,9 @@ def implicit_reward_loss(outputs,
     # 提取每个序列的最后一个非忽略token
     last_tokens = labels[torch.arange(batch_size), last_positions]  # [batch_size]
     
+    print('positive_token_id: ', positive_token_id)
+    print('last_positions:', last_positions, 'last_tokens:', last_tokens)
+    print('labels.shape:', labels.shape,'  labels[,-10:]: ', labels[...,-10:])
     # 创建真实奖励标签：1 for "good", 0 for "bad"
     r_gt = torch.where(
         last_tokens == positive_token_id,
@@ -856,6 +859,8 @@ def implicit_reward_loss(outputs,
     
     # 计算隐式奖励：加权和除以实际序列长度
     r_implicit = sum_weighted / seq_lengths.float()  # [batch_size]
+
+    print(f'implicit_reward_loss func, r_implicit:{r_implicit}, r_gt:{r_gt}')
     
     # 3. 计算MSE损失
     loss = torch.mean((r_implicit - r_gt) ** 2)
@@ -877,8 +882,8 @@ def mix_ce_ir_loss(outputs,
         loss_scale,
         num_items_in_batch,
         trainer,
-        gamma=0.95,  # 折扣因子，可配置
-        beta=0.02,   # 权重下限，新增超参数
+        gamma=gamma,  # 折扣因子，可配置
+        beta=beta,   # 权重下限，新增超参数
     )
     ce_loss = per_token_loss_func(outputs, labels)
     return mix_eta * ir_loss + (1 - mix_eta) * ce_loss
@@ -897,7 +902,8 @@ loss_mapping = {
     'listwise_reranker': listwise_reranker_loss,
     'listwise_generative_reranker': listwise_generative_reranker_loss,
 
-    'implicit_reward_loss': implicit_reward_loss
+    'implicit_reward_loss': implicit_reward_loss,
+    'mix_ce_ir_loss': mix_ce_ir_loss
 }
 
 
