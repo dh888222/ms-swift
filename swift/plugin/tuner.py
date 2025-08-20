@@ -104,6 +104,13 @@ class ImplicitRewardTuner:
             The wrapped model
         """
         # assert isinstance(model, Qwen2ForCausalLM), "Model must be an instance of Qwen2ForCausalLM"
+        # print("Initiate Implicit Reward Tuner, args:", args)
+        if (args.freeze_llm == True):
+            for name, param in model.named_parameters():
+                # 精确匹配additional_mlp及其子模块
+                if name.startswith("additional_mlp.") or name == "additional_mlp":
+                    continue
+                param.requires_grad = False
 
         # 检查模型是否已经被修改
         if hasattr(model, 'additional_mlp'):
@@ -173,6 +180,7 @@ class ImplicitRewardTuner:
         Returns:
             The wrapped model instance
         """
+        print("Loading model in from_pretrained function")
         # 先加载主模型（包括Swift适配器）
         model = Swift.from_pretrained(model, model_id, **kwargs)
         
@@ -189,11 +197,11 @@ class ImplicitRewardTuner:
                 # 使用safetensors加载
                 state_dict = safetensors.torch.load_file(mlp_path)
                 model.additional_mlp.load_state_dict(state_dict)
-                logger.info(f"Loaded additional MLP weights from {mlp_path}")
+                print(f"Loaded additional MLP weights from {mlp_path}")
             except Exception as e:
-                logger.warning(f"Failed to load additional MLP weights: {str(e)}")
+                print(f"Failed to load additional MLP weights: {str(e)}")
         else:
-            logger.info("No additional MLP weights found. Using initialized weights.")
+            print("No additional MLP weights found. Using initialized weights.")
         
         return model
 
@@ -205,7 +213,14 @@ class ImplicitRewardTuner:
         safe_serialization: bool = True,
         **kwargs,
     ) -> None:
-        # 保存主模型部分
+        import os, safetensors
+        # 2. 分离 additional_mlp 参数
+        mlp_state_dict = {}
+        for key in list(state_dict.keys()):
+            if "additional_mlp" in key:
+                mlp_state_dict[key] = state_dict.pop(key)
+        
+        # 3. 保存主模型（不包含 additional_mlp）
         model.save_pretrained(
             save_directory,
             state_dict=state_dict,
@@ -213,14 +228,11 @@ class ImplicitRewardTuner:
             **kwargs
         )
         
-        # 单独保存MLP层权重
-        if hasattr(model, 'additional_mlp'):
+        # 4. 单独保存 additional_mlp 参数
+        if mlp_state_dict:
             mlp_path = os.path.join(save_directory, 'additional_mlp.safetensors')
-            mlp_state_dict = model.additional_mlp.state_dict()
-            
-            # 使用safetensors保存
-            safetensors.torch.save_file(mlp_state_dict, mlp_path)
-            logger.info(f"Saved additional MLP weights to {mlp_path}")
+            safetensors.torch.save_file(mlp_state_dict, mlp_path, metadata={'format': 'pt'})
+            print(f"Saved additional MLP weights to {mlp_path}")
 
     @staticmethod
     def _init_mlp_weights(module):

@@ -10,7 +10,9 @@ from accelerate.utils import gather_object
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
 from transformers.utils import strtobool
+from swift.utils import get_logger
 
+logger = get_logger()
 
 def per_token_loss_func(outputs, labels, enable_dft_loss: bool = False, **kwargs):
     logits = outputs.logits
@@ -770,8 +772,8 @@ def implicit_reward_loss(outputs,
                          loss_scale=None,
                          num_items_in_batch=None,
                          trainer=None,
-                         gamma=0.95,  # 折扣因子，可配置
-                         beta=0.02,   # 权重下限，新增超参数
+                         gamma=0.99,  # 折扣因子，可配置
+                         eta=0.001,   # 权重下限，新增超参数
                          **kwargs) -> torch.Tensor:
     """
     Train implicit reward model using MSE loss between computed implicit reward and ground truth reward.
@@ -787,7 +789,7 @@ def implicit_reward_loss(outputs,
         num_items_in_batch: Not used
         trainer: Trainer instance to access tokenizer
         gamma: Discount factor for weighting past tokens
-        beta: Minimum weight factor (default 0.1)
+        eta: Minimum weight factor (default 0.001)
         **kwargs: Additional keyword arguments
 
     Returns:
@@ -811,18 +813,21 @@ def implicit_reward_loss(outputs,
         raise ValueError(f"Failed to convert tokens '{positive_token}'/'{negative_token}' to IDs. "
                          f'Please check if these tokens exist in the tokenizer vocabulary. Error: {e}')
     
-    # 创建mask：忽略-100的位置
+    # 创建忽略标记的掩码
     mask = labels != -100
-    
-    # 找到每个序列的最后一个非忽略位置
-    last_positions = mask.sum(dim=1) - 1  # [batch_size]
-    
+
+    # 从尾部开始查找第一个非忽略位置
+    # 技巧：将掩码反转后取 argmax
+    reversed_mask = mask.flip(dims=[1])  # 将每行反转
+    last_positions = reversed_mask.int().argmax(dim=1)  # 在反转序列中找第一个True
+    last_positions = labels.size(1) - 1 - last_positions  # 转换回原始位置
+
     # 提取每个序列的最后一个非忽略token
-    last_tokens = labels[torch.arange(batch_size), last_positions]  # [batch_size]
+    last_tokens = labels[torch.arange(batch_size), last_positions - 1]
     
-    print('positive_token_id: ', positive_token_id)
-    print('last_positions:', last_positions, 'last_tokens:', last_tokens)
-    print('labels.shape:', labels.shape,'  labels[,-10:]: ', labels[...,-10:])
+    # logger.info(f'positive_token_id: {positive_token_id}')
+    # logger.info(f'last_positions: {last_positions}, last_tokens: {last_tokens}')
+    # logger.info(f'labels.shape: {labels.shape},  labels[,-10:]:  {labels[...,-10:]}')
     # 创建真实奖励标签：1 for "good", 0 for "bad"
     r_gt = torch.where(
         last_tokens == positive_token_id,
@@ -851,7 +856,7 @@ def implicit_reward_loss(outputs,
     raw_weights[valid_mask] = gamma ** distance_to_end[valid_mask].float()
     
     # 应用权重下限：max(γ^{|y_i|-t}, β)
-    weights = torch.maximum(raw_weights, torch.tensor(beta, device=device))
+    weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
     
     # 计算加权奖励
     weighted_rewards = rewards * weights  # [batch_size, seq_len]
@@ -860,7 +865,7 @@ def implicit_reward_loss(outputs,
     # 计算隐式奖励：加权和除以实际序列长度
     r_implicit = sum_weighted / seq_lengths.float()  # [batch_size]
 
-    print(f'implicit_reward_loss func, r_implicit:{r_implicit}, r_gt:{r_gt}')
+    logger.info(f'implicit_reward_loss func, r_implicit:{r_implicit}, r_gt:{r_gt}')
     
     # 3. 计算MSE损失
     loss = torch.mean((r_implicit - r_gt) ** 2)
