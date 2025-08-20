@@ -822,10 +822,12 @@ def implicit_reward_loss(outputs,
     last_positions = reversed_mask.int().argmax(dim=1)  # 在反转序列中找第一个True
     last_positions = labels.size(1) - 1 - last_positions  # 转换回原始位置
 
+    # mask[last_positions] = 0
+    # mask[last_positions+1] = 0
     # 提取每个序列的最后一个非忽略token
     last_tokens = labels[torch.arange(batch_size), last_positions - 1]
     
-    # logger.info(f'positive_token_id: {positive_token_id}')
+    # logger.info(f'positive_token_id: {positive_token_id}， negative_token_id: {negative_token_id}')
     # logger.info(f'last_positions: {last_positions}, last_tokens: {last_tokens}')
     # logger.info(f'labels.shape: {labels.shape},  labels[,-10:]:  {labels[...,-10:]}')
     # 创建真实奖励标签：1 for "good", 0 for "bad"
@@ -839,31 +841,42 @@ def implicit_reward_loss(outputs,
     
     # 提取奖励值：logits的最后一个维度是奖励值
     rewards = logits[..., -1]  # [batch_size, seq_len]
-    
+
     # 计算每个序列的实际长度（非忽略位置的数量）
-    seq_lengths = mask.sum(dim=1)  # [batch_size]
-    
+    # swift sft 阶段的mask前几个似乎是-100，原因未知, 都采用last_positions的方式，这边忽略掉<EOS>和label标记位。
+    seq_lengths = last_positions - 2  # [batch_size]
+
+    # logger.info(f'labels[,:10]:  {labels[...,:10]}')
+    # logger.info(f'seq_lengths: {seq_lengths}, labels.shape: {labels.shape},  last_tokens:  {last_tokens}')
+
     # 创建时间折扣权重矩阵
     device = logits.device
     t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)  # [batch_size, seq_len]
-    
-    # 计算每个位置距离序列末尾的距离
+
+    # 计算每个位置距离序列末尾的距离（对应公式中的 |y_i| - t）
     distance_to_end = (seq_lengths.unsqueeze(1) - 1) - t_indices  # [batch_size, seq_len]
-    
-    # 计算原始权重γ^{distance_to_end}
+
+    # 计算原始权重 γ^{distance_to_end}（仅有效位置）
     raw_weights = torch.zeros_like(rewards, dtype=torch.float)
-    valid_mask = mask & (distance_to_end >= 0)  # 只考虑有效位置和有效距离
+    valid_mask = mask & (distance_to_end >= 0)  # 有效位置条件
     raw_weights[valid_mask] = gamma ** distance_to_end[valid_mask].float()
-    
-    # 应用权重下限：max(γ^{|y_i|-t}, β)
+
+    # 应用权重下限：max(γ^{|y_i|-t}, η)
     weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
-    
-    # 计算加权奖励
+
+    # 确保无效位置权重为0（重要！）
+    weights = weights * mask.float()
+
+    # 计算加权奖励和权重和
     weighted_rewards = rewards * weights  # [batch_size, seq_len]
     sum_weighted = weighted_rewards.sum(dim=1)  # [batch_size]
-    
-    # 计算隐式奖励：加权和除以实际序列长度
-    r_implicit = sum_weighted / seq_lengths.float()  # [batch_size]
+    sum_weights = weights.sum(dim=1)  # [batch_size]  # 分母：所有权重的和
+
+    # 避免除零错误（添加极小值）
+    sum_weights = sum_weights.clamp_min(1e-8)
+
+    # 计算隐式奖励：加权和除以权重和（符合公式定义）
+    r_implicit = sum_weighted / sum_weights  # [batch_size]
 
     logger.info(f'implicit_reward_loss func, r_implicit:{r_implicit}, r_gt:{r_gt}')
     

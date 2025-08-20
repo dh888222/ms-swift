@@ -1318,19 +1318,39 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # implicit_reward.shape = per_token_logps.shape = [B,S]
         if self.importance_sampling_level == 'implicit_reward':
             gamma, eta = 0.95, 0.02
+            device = completion_mask.device
 
             # 计算序列级隐式奖励 r_implicit(x,y_i) - 公式(3)
             # 获取序列有效长度 [batch_size]
-            seq_lens = completion_mask.sum(dim=-1).clamp(min=1)
+            seq_len = completion_mask.size(1)
+            seq_lengths = completion_mask.sum(dim=-1).clamp(min=1)
             
-            # 创建衰减权重矩阵 [batch_size, seq_len]
-            max_len = completion_mask.size(1)
-            exponents = (seq_lens.unsqueeze(1) - 1 - torch.arange(max_len, device=completion_mask.device))
-            decay_weights = torch.max(torch.pow(gamma, exponents), torch.tensor(eta, device=completion_mask.device))
-            decay_weights = decay_weights * completion_mask  # 应用mask
+            t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)  # [batch_size, seq_len]
+
+            # 计算每个位置距离序列末尾的距离（对应公式中的 |y_i| - t）
+            distance_to_end = (seq_lengths.unsqueeze(1) - 1) - t_indices  # [batch_size, seq_len]
+
+            # 计算原始权重 γ^{distance_to_end}（仅有效位置）
+            raw_weights = torch.zeros_like(rewards, dtype=torch.float)
+            valid_mask = mask & (distance_to_end >= 0)  # 有效位置条件
+            raw_weights[valid_mask] = gamma ** distance_to_end[valid_mask].float()
+
+            # 应用权重下限：max(γ^{|y_i|-t}, η)
+            weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
+
+            # 确保无效位置权重为0（重要！）
+            weights = weights * mask.float()
+
+            # 计算加权奖励和权重和
+            weighted_rewards = rewards * weights  # [batch_size, seq_len]
+            sum_weighted = weighted_rewards.sum(dim=1)  # [batch_size]
+            sum_weights = weights.sum(dim=1)  # [batch_size]  # 分母：所有权重的和
+
+            # 避免除零错误（添加极小值）
+            sum_weights = sum_weights.clamp_min(1e-8)
             
             # 计算加权平均隐式奖励 [batch_size]
-            r_implicit_seq = (implicit_rewards * decay_weights).sum(dim=-1) / seq_lens
+            r_implicit_seq = (implicit_rewards * decay_weights).sum(dim=-1) / sum_weights
             
             # 计算权重 w_i = r_verifier / r_implicit [batch_size]
             w_i = verifier_rewards / (r_implicit_seq + 1e-8)
