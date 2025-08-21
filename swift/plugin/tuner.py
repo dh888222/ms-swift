@@ -91,7 +91,45 @@ class DummyTuner(PeftTuner):
     def prepare_model(args: 'TrainArguments', model: torch.nn.Module) -> torch.nn.Module:
         return model
 
+
+import os, safetensors
+from collections import OrderedDict
+import copy
 class ImplicitRewardTuner:
+    @staticmethod
+    def load_mlp(model:torch.nn.Module, model_id) -> torch.nn.Module:
+        print("start to load mlp!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!, path:", model_id)
+        # 尝试加载额外的MLP权重
+
+        # 尝试加载额外的MLP权重
+        mlp_path = os.path.join(model_id, 'additional_mlp.safetensors')
+        if os.path.exists(mlp_path):
+            try:
+                # 使用safetensors加载
+                state_dict = safetensors.torch.load_file(mlp_path)
+                
+                # 创建新的状态字典，移除"additional_mlp."前缀
+                new_state_dict = OrderedDict()
+                for key, value in state_dict.items():
+                    # 移除"additional_mlp."前缀
+                    if key.startswith('additional_mlp.'):
+                        new_key = key[len('additional_mlp.'):]
+                    else:
+                        new_key = key
+                    new_state_dict[new_key] = value
+                
+                # 加载到MLP层
+                model.additional_mlp.load_state_dict(new_state_dict)
+                print(f"Loaded additional MLP weights from {mlp_path}")
+            except Exception as e:
+                print(f"Failed to load additional MLP weights: {str(e)}")
+                # 打印状态字典键名以帮助调试
+                print(f"Expected keys: {list(model.additional_mlp.state_dict().keys())}")
+                print(f"Loaded keys: {list(state_dict.keys())}")
+        else:
+            print("No additional MLP weights found. Using initialized weights.")
+
+        return model
     @staticmethod
     def prepare_model(args: 'TrainArguments', model: torch.nn.Module) -> torch.nn.Module:
         """Prepare a new model with a tuner
@@ -103,7 +141,6 @@ class ImplicitRewardTuner:
         Returns:
             The wrapped model
         """
-        # assert isinstance(model, Qwen2ForCausalLM), "Model must be an instance of Qwen2ForCausalLM"
         # print("Initiate Implicit Reward Tuner, args:", args)
         if (args.freeze_llm == True):
             for name, param in model.named_parameters():
@@ -115,6 +152,7 @@ class ImplicitRewardTuner:
         # 检查模型是否已经被修改
         if hasattr(model, 'additional_mlp'):
             return model  # 如果已经修改过，直接返回
+        
 
         # 定义新的 MLP
         class AdditionalMLP(nn.Module):
@@ -123,10 +161,11 @@ class ImplicitRewardTuner:
                 self.linear1 = nn.Linear(input_size, hidden_size)
                 self.linear2 = nn.Linear(hidden_size, output_size)
                 self.act = nn.ReLU()
+                self.sigmoid = nn.Sigmoid()
 
             def forward(self, x):
                 x = self.act(self.linear1(x))
-                return self.linear2(x)
+                return self.sigmoid(self.linear2(x))
 
         # 创建并添加新的 MLP
         hidden_size = model.config.hidden_size
@@ -162,11 +201,17 @@ class ImplicitRewardTuner:
                 attentions=None
             )
 
+        # 保存原始的 forward 方法
+        setattr(model, '_original_forward', model.forward)
         # 使用 setattr 替换原始的 forward 方法
-        setattr(model, 'forward', new_forward.__get__(model))
+        setattr(model, '_new_forward', new_forward.__get__(model))
+        setattr(model, 'forward', model._new_forward)
 
         # 初始化新添加的 MLP 权重
         ImplicitRewardTuner._init_mlp_weights(model.additional_mlp)
+
+        # 尝试载入
+        model = ImplicitRewardTuner.load_mlp(model, args.model)
 
         return model
 
@@ -188,20 +233,9 @@ class ImplicitRewardTuner:
         if not hasattr(model, 'additional_mlp'):
             # 如果模型没有MLP层，添加它
             model = ImplicitRewardTuner.prepare_model(None, model)
-            logger.info("Added additional MLP layer to the model")
-        
-        # 尝试加载额外的MLP权重
-        mlp_path = os.path.join(model_id, 'additional_mlp.safetensors')
-        if os.path.exists(mlp_path):
-            try:
-                # 使用safetensors加载
-                state_dict = safetensors.torch.load_file(mlp_path)
-                model.additional_mlp.load_state_dict(state_dict)
-                print(f"Loaded additional MLP weights from {mlp_path}")
-            except Exception as e:
-                print(f"Failed to load additional MLP weights: {str(e)}")
-        else:
-            print("No additional MLP weights found. Using initialized weights.")
+            print("Added additional MLP layer to the model")
+
+        model = self.load_mlp(model, model_id)
         
         return model
 
@@ -213,26 +247,50 @@ class ImplicitRewardTuner:
         safe_serialization: bool = True,
         **kwargs,
     ) -> None:
-        import os, safetensors
-        # 2. 分离 additional_mlp 参数
-        mlp_state_dict = {}
-        for key in list(state_dict.keys()):
-            if "additional_mlp" in key:
-                mlp_state_dict[key] = state_dict.pop(key)
+        # 创建模型的深度副本（不包含MLP）
+        clean_model = copy.deepcopy(model)
         
-        # 3. 保存主模型（不包含 additional_mlp）
-        model.save_pretrained(
+        # 从副本中移除所有MLP相关属性
+        if hasattr(clean_model, 'additional_mlp'):
+            delattr(clean_model, 'additional_mlp')
+        
+        if hasattr(clean_model, '_original_forward'):
+            # 恢复原始forward方法
+            setattr(clean_model, 'forward', clean_model._original_forward)
+            delattr(clean_model, '_original_forward')
+            delattr(clean_model, '_new_forward')
+        
+        # 准备状态字典（过滤掉MLP相关权重）
+        if state_dict is None:
+            state_dict = model.state_dict()
+        
+        # 创建过滤后的状态字典
+        clean_state_dict = OrderedDict()
+        for key, value in state_dict.items():
+            if 'additional_mlp' not in key:
+                clean_state_dict[key] = value
+        
+        # 保存干净的模型（不包含任何MLP痕迹）
+        clean_model.save_pretrained(
             save_directory,
-            state_dict=state_dict,
+            state_dict=clean_state_dict,
             safe_serialization=safe_serialization,
             **kwargs
         )
         
-        # 4. 单独保存 additional_mlp 参数
-        if mlp_state_dict:
-            mlp_path = os.path.join(save_directory, 'additional_mlp.safetensors')
-            safetensors.torch.save_file(mlp_state_dict, mlp_path, metadata={'format': 'pt'})
-            print(f"Saved additional MLP weights to {mlp_path}")
+        # 单独保存MLP层权重
+        if hasattr(model, 'additional_mlp'):
+            # 提取MLP权重
+            mlp_state_dict = OrderedDict()
+            for key, value in state_dict.items():
+                if 'additional_mlp' in key:
+                    mlp_state_dict[key] = value
+            
+            # 保存到单独的文件
+            if mlp_state_dict:
+                mlp_path = os.path.join(save_directory, 'additional_mlp.safetensors')
+                safetensors.torch.save_file(mlp_state_dict, mlp_path)
+                print(f"Saved additional MLP weights to {mlp_path}")
 
     @staticmethod
     def _init_mlp_weights(module):

@@ -584,6 +584,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
                     if self.vllm_mode == 'server' and self.accelerator.is_main_process:
                         for name, param in state_dict.items():
+                            # 跳过additional_mlp及其子模块
+                            if name.startswith("additional_mlp.") or name == "additional_mlp":
+                                continue
                             self.vllm_client.update_named_param(name, param)
                     elif self.vllm_mode == 'colocate':
                         llm_model = self.engine.inner_model
@@ -595,6 +598,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             for name, param in self.model.named_parameters():
                 with gather_if_zero3([param]):
                     if self.vllm_mode == 'server' and self.accelerator.is_main_process:
+                        # 跳过additional_mlp及其子模块
+                        if name.startswith("additional_mlp.") or name == "additional_mlp":
+                            continue
                         self.vllm_client.update_named_param(name, param.data)
                     elif self.vllm_mode == 'colocate':
                         llm_model = self.engine.inner_model
@@ -1267,7 +1273,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if self.importance_sampling_level == 'implicit_reward':
             per_token_logps, entropies, implicit_rewards = self._get_per_token_logps_and_entropies(
-                model, inputs, compute_entropy=self.compute_entropy)
+                model, inputs, compute_entropy=self.compute_entropy, implicit_reward=True)
         else:
             per_token_logps, entropies = self._get_per_token_logps_and_entropies(
                 model, inputs, compute_entropy=self.compute_entropy)
@@ -1317,53 +1323,55 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         
         # implicit_reward.shape = per_token_logps.shape = [B,S]
         if self.importance_sampling_level == 'implicit_reward':
-            gamma, eta = 0.95, 0.02
+            gamma, eta = 0.99, 0.001
             device = completion_mask.device
+            print(f"completion_mask[...,-10:]: {completion_mask[...,-10:]}")
 
             # 计算序列级隐式奖励 r_implicit(x,y_i) - 公式(3)
-            # 获取序列有效长度 [batch_size]
-            seq_len = completion_mask.size(1)
-            seq_lengths = completion_mask.sum(dim=-1).clamp(min=1)
+            device = completion_mask.device
+            batch_size, seq_len = completion_mask.shape
+
+            # 从尾部开始查找第一个非忽略位置
+            # 技巧：将掩码反转后取 argmax
+            seq_lengths = completion_mask.sum(dim=1)
+            print(f"implicit_rewards.shape:{implicit_rewards.shape}, completion_mask.shape:{completion_mask.shape}")
             
-            t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)  # [batch_size, seq_len]
+            t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)
+            distance_to_end = (seq_lengths.unsqueeze(1) - 1) - t_indices
 
-            # 计算每个位置距离序列末尾的距离（对应公式中的 |y_i| - t）
-            distance_to_end = (seq_lengths.unsqueeze(1) - 1) - t_indices  # [batch_size, seq_len]
-
-            # 计算原始权重 γ^{distance_to_end}（仅有效位置）
-            raw_weights = torch.zeros_like(rewards, dtype=torch.float)
-            valid_mask = mask & (distance_to_end >= 0)  # 有效位置条件
+            raw_weights = torch.zeros_like(completion_mask, dtype=torch.float)
+            valid_mask = completion_mask & (distance_to_end >= 0)
             raw_weights[valid_mask] = gamma ** distance_to_end[valid_mask].float()
 
-            # 应用权重下限：max(γ^{|y_i|-t}, η)
             weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
+            weights = weights * completion_mask.float()
 
-            # 确保无效位置权重为0（重要！）
-            weights = weights * mask.float()
-
-            # 计算加权奖励和权重和
-            weighted_rewards = rewards * weights  # [batch_size, seq_len]
-            sum_weighted = weighted_rewards.sum(dim=1)  # [batch_size]
-            sum_weights = weights.sum(dim=1)  # [batch_size]  # 分母：所有权重的和
-
-            # 避免除零错误（添加极小值）
-            sum_weights = sum_weights.clamp_min(1e-8)
-            
             # 计算加权平均隐式奖励 [batch_size]
-            r_implicit_seq = (implicit_rewards * decay_weights).sum(dim=-1) / sum_weights
+            sum_weighted = (implicit_rewards * weights).sum(dim=1)
+            sum_weights = weights.sum(dim=1).clamp_min(1e-8)
+            r_implicit_seq = sum_weighted / sum_weights
+
+            # 计算MSE损失 L_R(θ) 
+            mse_loss = torch.mean((r_implicit_seq - verifier_rewards) ** 2)
             
-            # 计算权重 w_i = r_verifier / r_implicit [batch_size]
-            w_i = verifier_rewards / (r_implicit_seq + 1e-8)
+            r_hat_implicit = implicit_rewards * verifier_rewards.unsqueeze(1)
+            r_hat_implicit = r_hat_implicit * completion_mask.float()
+            m_hat_implicit = r_hat_implicit.sum(dim=1) / seq_lengths.clamp_min(1e-8) #[batch_size]
             
-            # 计算新的优势函数 A^GIRPO - 公式(2)
-            weighted_implicit = w_i.unsqueeze(1) * implicit_rewards  # [batch_size, seq_len]
-            per_token_advantages = (weighted_implicit - group_mean) / (group_std + 1e-8)  # [batch_size, seq_len]
+            # 计算全局统计量（整个batch的有效token）
+            if valid_weighted_implicit.numel() > 0:
+                group_mean = m_hat_implicit.mean()
+                group_std = m_hat_implicit.std(unbiased=False)
+            else:
+                group_mean = torch.tensor(0.0, device=device)
+                group_std = torch.tensor(1.0, device=device)
+            
+            # 计算每个token的优势值
+            per_token_advantages = (r_hat_implicit - group_mean) / (group_std + 1e-8)
             
             # 替换原始advantages
             advantages = per_token_advantages
             
-            # 计算MSE损失 L_R(θ) - 公式(4)第二部分
-            mse_loss = torch.mean((r_implicit_seq - verifier_rewards) ** 2)
 
         log_ratio = per_token_logps - old_per_token_logps # [batch, seq_len]
         if self.importance_sampling_level == 'token':
