@@ -260,10 +260,6 @@ class ImplicitRewardTuner:
             delattr(clean_model, '_original_forward')
             delattr(clean_model, '_new_forward')
         
-        # 准备状态字典（过滤掉MLP相关权重）
-        if state_dict is None:
-            state_dict = model.state_dict()
-        
         # 创建过滤后的状态字典
         clean_state_dict = OrderedDict()
         for key, value in state_dict.items():
@@ -277,6 +273,8 @@ class ImplicitRewardTuner:
             safe_serialization=safe_serialization,
             **kwargs
         )
+
+        print("Saved clean model: ",clean_model)
         
         # 单独保存MLP层权重
         if hasattr(model, 'additional_mlp'):

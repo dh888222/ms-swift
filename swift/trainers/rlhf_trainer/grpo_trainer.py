@@ -1359,7 +1359,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             m_hat_implicit = r_hat_implicit.sum(dim=1) / seq_lengths.clamp_min(1e-8) #[batch_size]
             
             # 计算全局统计量（整个batch的有效token）
-            if valid_weighted_implicit.numel() > 0:
+            if m_hat_implicit.numel() > 0:
                 group_mean = m_hat_implicit.mean()
                 group_std = m_hat_implicit.std(unbiased=False)
             else:
@@ -1418,7 +1418,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             raise ValueError(f'Unknown loss type: {self.loss_type}')
         
         if self.importance_sampling_level == 'implicit_reward':
-            alpha = 0.7
+            alpha = 0.9
             loss = alpha * loss + (1 - alpha) * mse_loss
 
         completion_token_count = completion_mask.sum().clamp(min=1.0)
@@ -1566,6 +1566,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             with self._template_context(self.template), self.padding_free_context(model):
                 logits = model(**inputs).logits
 
+            # exclude the last logit: it corresponds to the next token pred
+            logits = logits[:, -(logits_to_keep + 1):-1, :]
+
             # 在 _get_per_token_logps_and_entropies 方法中
             if self.importance_sampling_level == 'implicit_reward':
                 # 确保有足够的维度来处理隐式奖励
@@ -1576,14 +1579,13 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 implicit_rewards = logits[..., -1]
                 logits = logits[..., :-1]
             
-            # exclude the last logit: it corresponds to the next token pred
-            logits = logits[:, -(logits_to_keep + 1):-1, :]
             logits = logits / self.temperature
             input_ids = input_ids[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
             entropies = None
             if compute_entropy:
                 entropies = entropy_from_logits(logits)
+        #print(f"input_ids.shape:{input_ids.shape}, implicit_rewards.shape:{implicit_rewards.shape}")
         if implicit_reward:
             return logps, entropies, implicit_rewards
         return logps, entropies
