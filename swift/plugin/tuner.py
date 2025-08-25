@@ -130,6 +130,7 @@ class ImplicitRewardTuner:
             print("No additional MLP weights found. Using initialized weights.")
 
         return model
+
     @staticmethod
     def prepare_model(args: 'TrainArguments', model: torch.nn.Module) -> torch.nn.Module:
         """Prepare a new model with a tuner
@@ -187,7 +188,7 @@ class ImplicitRewardTuner:
             lm_logits = self.lm_head(last_hidden_state)
             
             # 通过额外的 MLP
-            additional_output = self.additional_mlp(last_hidden_state)
+            additional_output = self.additional_mlp(last_hidden_state.detach())
 
             # 拼接原始 lm_head 输出和新 MLP 的输出
             combined_logits = torch.cat([lm_logits, additional_output], dim=-1)

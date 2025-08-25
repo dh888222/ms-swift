@@ -1323,56 +1323,81 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         
         # implicit_reward.shape = per_token_logps.shape = [B,S]
         if self.importance_sampling_level == 'implicit_reward':
-            gamma, eta = 0.99, 0.001
-            device = completion_mask.device
-            print(f"completion_mask[...,-10:]: {completion_mask[...,-10:]}")
-
-            # 计算序列级隐式奖励 r_implicit(x,y_i) - 公式(3)
+            gamma, eta = 0.95, 0
             device = completion_mask.device
             batch_size, seq_len = completion_mask.shape
 
-            # 从尾部开始查找第一个非忽略位置
-            # 技巧：将掩码反转后取 argmax
-            seq_lengths = completion_mask.sum(dim=1)
-            print(f"implicit_rewards.shape:{implicit_rewards.shape}, completion_mask.shape:{completion_mask.shape}")
-            
-            t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)
-            distance_to_end = (seq_lengths.unsqueeze(1) - 1) - t_indices
+            # =====================================================================
+            # 计算每个时间步的隐式奖励加权平均 \hat{r}_{implicit}(y_{i,t} | x, y_{i,<t})
+            # 对应公式(1): [batch_size, seq_len]
+            # =====================================================================
+            # 创建时间差矩阵 [seq_len, seq_len]
+            t_indices = torch.arange(seq_len, device=device)
+            diff_matrix = t_indices.unsqueeze(1) - t_indices.unsqueeze(0)  # [seq_len, seq_len]
 
-            raw_weights = torch.zeros_like(completion_mask, dtype=torch.float)
-            valid_mask = completion_mask & (distance_to_end >= 0)
-            raw_weights[valid_mask] = gamma ** distance_to_end[valid_mask].float()
+            # 基础权重矩阵 (包含上三角部分，后续会屏蔽)
+            weight_matrix_base = torch.maximum(
+                gamma ** diff_matrix, 
+                torch.tensor(eta, device=device)
+            )  # [seq_len, seq_len]
 
-            weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
-            weights = weights * completion_mask.float()
+            # 创建下三角掩码 (k <= t)
+            lower_tri_mask = (diff_matrix >= 0)  # [seq_len, seq_len]
 
-            # 计算加权平均隐式奖励 [batch_size]
-            sum_weighted = (implicit_rewards * weights).sum(dim=1)
-            sum_weights = weights.sum(dim=1).clamp_min(1e-8)
-            r_implicit_seq = sum_weighted / sum_weights
+            # 有效位置掩码 [batch_size, seq_len, seq_len]
+            valid_mask = completion_mask.unsqueeze(1)  # [batch_size, 1, seq_len]
+            valid_mask_matrix = valid_mask & lower_tri_mask.unsqueeze(0)  # 广播
 
-            # 计算MSE损失 L_R(θ) 
+            # 最终权重矩阵 [batch_size, seq_len, seq_len]
+            weight_matrix = weight_matrix_base.unsqueeze(0) * valid_mask_matrix.float()
+
+            # 掩码处理隐式奖励 [batch_size, seq_len]
+            implicit_rewards_masked = implicit_rewards * completion_mask.float()
+
+            # 计算加权分子和分母 [batch_size, seq_len]
+            S_t = torch.einsum('bst,bst->bs', weight_matrix, implicit_rewards_masked.unsqueeze(1))
+            W_t = weight_matrix.sum(dim=2).clamp_min(1e-8)  # 分母
+
+            # 每个时间步的隐式奖励加权平均 [batch_size, seq_len]
+            r_hat_implicit_t = S_t / W_t
+
+            # =====================================================================
+            # 计算序列级隐式奖励 r_implicit(x,y_i) 
+            # 对应公式(2): [batch_size]
+            # =====================================================================
+            # 获取每个序列的最后一个有效位置索引
+            last_indices = completion_mask.sum(dim=1) - 1  # [batch_size]
+
+            # 提取每个序列末尾的隐式奖励加权平均
+            r_implicit_seq = r_hat_implicit_t[torch.arange(batch_size), last_indices]
+
+            # =====================================================================
+            # 计算MSE损失 L_R(θ)
+            # =====================================================================
             mse_loss = torch.mean((r_implicit_seq - verifier_rewards) ** 2)
-            
-            r_hat_implicit = implicit_rewards * verifier_rewards.unsqueeze(1)
-            r_hat_implicit = r_hat_implicit * completion_mask.float()
-            m_hat_implicit = r_hat_implicit.sum(dim=1) / seq_lengths.clamp_min(1e-8) #[batch_size]
-            
-            # 计算全局统计量（整个batch的有效token）
-            if m_hat_implicit.numel() > 0:
-                group_mean = m_hat_implicit.mean()
-                group_std = m_hat_implicit.std(unbiased=False)
-            else:
-                group_mean = torch.tensor(0.0, device=device)
-                group_std = torch.tensor(1.0, device=device)
-            
-            # 计算每个token的优势值
-            per_token_advantages = (r_hat_implicit - group_mean) / (group_std + 1e-8)
-            
-            # 替换原始advantages
-            advantages = per_token_advantages
-            
 
+            # =====================================================================
+            # 计算全局GSPO优势 \hat{A}^{GSPO}_i 
+            # 对应公式(3)的第二部分: [batch_size]
+            # =====================================================================
+            # group_mean = verifier_rewards.mean()
+            # group_std = verifier_rewards.std(unbiased=False)  # 有偏标准差
+            # A_i = (verifier_rewards - group_mean) / (group_std + 1e-8)  # [batch_size]
+            A_i = advantages  # [batch_size]
+
+            # =====================================================================
+            # 计算每个token的GIRPO优势 \hat{A}^{GIRPO}_{i,t}
+            # 对应公式(3): [batch_size, seq_len]
+            # =====================================================================
+            # 扩展为每个token的优势值
+            expanded_A_i = A_i.unsqueeze(1).expand(-1, seq_len)  # [batch_size, seq_len]
+
+            # 计算最终优势值
+            per_token_advantages = r_hat_implicit_t * expanded_A_i  # [batch_size, seq_len]
+
+            # 应用完成掩码
+            per_token_advantages = per_token_advantages * completion_mask.float()
+            
         log_ratio = per_token_logps - old_per_token_logps # [batch, seq_len]
         if self.importance_sampling_level == 'token':
             log_importance_weights = log_ratio
