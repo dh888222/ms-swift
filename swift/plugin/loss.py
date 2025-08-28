@@ -772,7 +772,7 @@ def implicit_reward_loss(outputs,
                          loss_scale=None,
                          num_items_in_batch=None,
                          trainer=None,
-                         gamma=0.99,  # 折扣因子，可配置
+                         gamma=0.98,  # 折扣因子，可配置
                          eta=0.001,   # 权重下限，新增超参数
                          **kwargs) -> torch.Tensor:
     """
@@ -840,49 +840,57 @@ def implicit_reward_loss(outputs,
     # 2. 计算隐式奖励（按照公式 r_implicit = (1/|y_i|) * Σ γ^{|y_i|-t} * r_{i,t}）
     
     # 提取奖励值：logits的最后一个维度是奖励值
-    rewards = logits[..., -1]  # [batch_size, seq_len]
-
+    implicit_rewards = logits[..., -1] * mask.float() # [batch_size, seq_len]
+    # '''
     # 计算每个序列的实际长度（非忽略位置的数量）
-    # swift sft 阶段的mask前几个似乎是-100，原因未知, 都采用last_positions的方式，这边忽略掉<EOS>和label标记位。
-    seq_lengths = last_positions - 2  # [batch_size]
+    # swift sft 阶段的mask前几个似乎是-100，原因未知, 都采用last_positions的方式
+    seq_lengths = last_positions + 1  # [batch_size]
 
     # logger.info(f'labels[,:10]:  {labels[...,:10]}')
-    # logger.info(f'seq_lengths: {seq_lengths}, labels.shape: {labels.shape},  last_tokens:  {last_tokens}')
 
     # 创建时间折扣权重矩阵
     device = logits.device
-    t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)  # [batch_size, seq_len]
 
-    # 计算每个位置距离序列末尾的距离（对应公式中的 |y_i| - t）
+    # 创建时间索引 [batch_size, seq_len]
+    t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)
+
+    # print(f'seq_lengths: {seq_lengths}, labels.shape: {labels.shape}, t_indices.shape:  {t_indices.shape}')
+
+    # 计算每个位置到序列末尾的距离 [batch_size, seq_len]
     distance_to_end = (seq_lengths.unsqueeze(1) - 1) - t_indices  # [batch_size, seq_len]
 
-    # 计算原始权重 γ^{distance_to_end}（仅有效位置）
-    raw_weights = torch.zeros_like(rewards, dtype=torch.float)
-    valid_mask = mask & (distance_to_end >= 0)  # 有效位置条件
-    raw_weights[valid_mask] = gamma ** distance_to_end[valid_mask].float()
-
-    # 应用权重下限：max(γ^{|y_i|-t}, η)
+    # 计算基础权重 [batch_size, seq_len]
+    raw_weights = gamma ** distance_to_end.float().clamp(min=0)  # 确保距离非负
     weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
 
-    # 确保无效位置权重为0（重要！）
+    # 应用完成掩码 [batch_size, seq_len]
     weights = weights * mask.float()
 
-    # 计算加权奖励和权重和
-    weighted_rewards = rewards * weights  # [batch_size, seq_len]
-    sum_weighted = weighted_rewards.sum(dim=1)  # [batch_size]
-    sum_weights = weights.sum(dim=1)  # [batch_size]  # 分母：所有权重的和
+    # 计算累积权重和 [batch_size, seq_len]
+    # 使用cumsum实现高效计算
+    cum_weights = torch.cumsum(weights, dim=1)  # [batch_size, seq_len]
+    cum_weighted_rewards = torch.cumsum(weights * implicit_rewards, dim=1)  # [batch_size, seq_len]
 
-    # 避免除零错误（添加极小值）
-    sum_weights = sum_weights.clamp_min(1e-8)
+    # 计算每个时间步的加权平均 [batch_size, seq_len]
+    # 添加小常数防止除零错误
+    r_hat_implicit_t = cum_weighted_rewards / cum_weights.clamp_min(1e-8)
 
-    # 计算隐式奖励：加权和除以权重和（符合公式定义）
-    r_implicit = sum_weighted / sum_weights  # [batch_size]
+    # 提取每个序列末尾的隐式奖励加权平均
+    r_implicit_seq = r_hat_implicit_t[torch.arange(batch_size), seq_lengths - 1]
 
-    logger.info(f'implicit_reward_loss func, r_implicit:{r_implicit}, r_gt:{r_gt}')
-    
+    logger.info(f'implicit_reward_loss func, r_implicit_seq:{r_implicit_seq}, r_gt:{r_gt}')
+    # '''
+
     # 3. 计算MSE损失
-    loss = torch.mean((r_implicit - r_gt) ** 2)
-    
+    # loss = torch.mean((r_hat_implicit_t - r_gt.unsqueeze(1)) ** 2) # (sentence level?) weighted loss
+    per_seq_loss = torch.mean((r_implicit_seq - r_gt) ** 2) # sequence level weighted loss.
+    per_token_loss = torch.mean((implicit_rewards - r_gt.unsqueeze(1)) ** 2) # Direct implict reward loss.(May conclude lots of noise.)
+
+    alpha = 0.7
+    loss = alpha * per_token_loss + (1 - alpha) * per_seq_loss
+
+    # print(f"loss:{loss}")
+
     return loss
 
 def mix_ce_ir_loss(outputs,

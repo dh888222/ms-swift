@@ -1141,6 +1141,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         ga_batch_encoded_inputs = []
         for i, (batch, batch_rewards, batch_mean, batch_std, batch_advantages) in enumerate(zip(gas_chunks, reward_chunks, mean_chunks, std_chunks, advantage_chunks)):
+        # for i, (batch, batch_advantages) in enumerate(zip(gas_chunks, advantage_chunks)):
             # Encode and process each batch (size=bs)
             with self._template_context(template):
                 batch_encoded_inputs = [template.encode(infer_request) for infer_request in batch]
@@ -1323,7 +1324,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         
         # implicit_reward.shape = per_token_logps.shape = [B,S]
         if self.importance_sampling_level == 'implicit_reward':
-            gamma, eta = 0.95, 0
+            gamma, eta = 0.9, 0.00
             device = completion_mask.device
             batch_size, seq_len = completion_mask.shape
 
@@ -1331,35 +1332,28 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # 计算每个时间步的隐式奖励加权平均 \hat{r}_{implicit}(y_{i,t} | x, y_{i,<t})
             # 对应公式(1): [batch_size, seq_len]
             # =====================================================================
-            # 创建时间差矩阵 [seq_len, seq_len]
-            t_indices = torch.arange(seq_len, device=device)
-            diff_matrix = t_indices.unsqueeze(1) - t_indices.unsqueeze(0)  # [seq_len, seq_len]
+            # 创建时间索引 [batch_size, seq_len]
+            t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)
 
-            # 基础权重矩阵 (包含上三角部分，后续会屏蔽)
-            weight_matrix_base = torch.maximum(
-                gamma ** diff_matrix, 
-                torch.tensor(eta, device=device)
-            )  # [seq_len, seq_len]
+            # 计算每个位置到序列末尾的距离 [batch_size, seq_len]
+            seq_lengths = completion_mask.sum(dim=1, keepdim=True)  # [batch_size, 1]
+            distance_to_end = (seq_lengths - 1) - t_indices  # [batch_size, seq_len]
 
-            # 创建下三角掩码 (k <= t)
-            lower_tri_mask = (diff_matrix >= 0)  # [seq_len, seq_len]
+            # 计算基础权重 [batch_size, seq_len]
+            raw_weights = gamma ** distance_to_end.float().clamp(min=0)  # 确保距离非负
+            weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
 
-            # 有效位置掩码 [batch_size, seq_len, seq_len]
-            valid_mask = completion_mask.unsqueeze(1)  # [batch_size, 1, seq_len]
-            valid_mask_matrix = valid_mask & lower_tri_mask.unsqueeze(0)  # 广播
+            # 应用完成掩码 [batch_size, seq_len]
+            weights = weights * completion_mask.float()
 
-            # 最终权重矩阵 [batch_size, seq_len, seq_len]
-            weight_matrix = weight_matrix_base.unsqueeze(0) * valid_mask_matrix.float()
+            # 计算累积权重和 [batch_size, seq_len]
+            # 使用cumsum实现高效计算
+            cum_weights = torch.cumsum(weights, dim=1)  # [batch_size, seq_len]
+            cum_weighted_rewards = torch.cumsum(weights * implicit_rewards, dim=1)  # [batch_size, seq_len]
 
-            # 掩码处理隐式奖励 [batch_size, seq_len]
-            implicit_rewards_masked = implicit_rewards * completion_mask.float()
-
-            # 计算加权分子和分母 [batch_size, seq_len]
-            S_t = torch.einsum('bst,bst->bs', weight_matrix, implicit_rewards_masked.unsqueeze(1))
-            W_t = weight_matrix.sum(dim=2).clamp_min(1e-8)  # 分母
-
-            # 每个时间步的隐式奖励加权平均 [batch_size, seq_len]
-            r_hat_implicit_t = S_t / W_t
+            # 计算每个时间步的加权平均 [batch_size, seq_len]
+            # 添加小常数防止除零错误
+            r_hat_implicit_t = cum_weighted_rewards / cum_weights.clamp_min(1e-8)
 
             # =====================================================================
             # 计算序列级隐式奖励 r_implicit(x,y_i) 
@@ -1371,10 +1365,12 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # 提取每个序列末尾的隐式奖励加权平均
             r_implicit_seq = r_hat_implicit_t[torch.arange(batch_size), last_indices]
 
+            # print(f"r_implicit_seq:{r_implicit_seq}")
+
             # =====================================================================
             # 计算MSE损失 L_R(θ)
             # =====================================================================
-            mse_loss = torch.mean((r_implicit_seq - verifier_rewards) ** 2)
+            mse_loss = torch.mean((implicit_rewards - verifier_rewards.unsqueeze(1)) ** 2)
 
             # =====================================================================
             # 计算全局GSPO优势 \hat{A}^{GSPO}_i 
@@ -1387,16 +1383,25 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
             # =====================================================================
             # 计算每个token的GIRPO优势 \hat{A}^{GIRPO}_{i,t}
-            # 对应公式(3): [batch_size, seq_len]
+            # 对应新公式: [batch_size, seq_len]
             # =====================================================================
-            # 扩展为每个token的优势值
-            expanded_A_i = A_i.unsqueeze(1).expand(-1, seq_len)  # [batch_size, seq_len]
+            # 分离梯度操作 (sg = stop gradient)
+            r_hat_implicit_t_detached = r_hat_implicit_t.detach()  # [batch_size, seq_len]
 
-            # 计算最终优势值
-            per_token_advantages = r_hat_implicit_t * expanded_A_i  # [batch_size, seq_len]
+            # 扩展A_i到每个token [batch_size, seq_len]
+            expanded_A_i = A_i.unsqueeze(1).expand(-1, seq_len)
+
+            # 直接计算优势值，仅当A_i<0时进行特殊处理
+            # 利用广播机制，避免创建大型中间张量
+            per_token_advantages = torch.where(
+                expanded_A_i >= 0,  # 条件
+                r_hat_implicit_t_detached.detach() * expanded_A_i,  # A_i>=0时的计算
+                (1 - r_hat_implicit_t_detached.detach()) * expanded_A_i  # A_i<0时的计算
+            )
 
             # 应用完成掩码
             per_token_advantages = per_token_advantages * completion_mask.float()
+            advantages = per_token_advantages.detach()
             
         log_ratio = per_token_logps - old_per_token_logps # [batch, seq_len]
         if self.importance_sampling_level == 'token':
@@ -1443,8 +1448,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             raise ValueError(f'Unknown loss type: {self.loss_type}')
         
         if self.importance_sampling_level == 'implicit_reward':
-            alpha = 0.9
+            alpha = 1
             loss = alpha * loss + (1 - alpha) * mse_loss
+            # loss = loss + mse_loss
 
         completion_token_count = completion_mask.sum().clamp(min=1.0)
 
