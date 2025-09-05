@@ -772,8 +772,8 @@ def implicit_reward_loss(outputs,
                          loss_scale=None,
                          num_items_in_batch=None,
                          trainer=None,
-                         gamma=0.98,  # 折扣因子，可配置
-                         eta=0.001,   # 权重下限，新增超参数
+                         gamma=0.95,  # 折扣因子，可配置
+                         eta=0.01,   # 权重下限，新增超参数
                          **kwargs) -> torch.Tensor:
     """
     Train implicit reward model using MSE loss between computed implicit reward and ground truth reward.
@@ -886,7 +886,7 @@ def implicit_reward_loss(outputs,
     per_seq_loss = torch.mean((r_implicit_seq - r_gt) ** 2) # sequence level weighted loss.
     per_token_loss = torch.mean((implicit_rewards - r_gt.unsqueeze(1)) ** 2) # Direct implict reward loss.(May conclude lots of noise.)
 
-    alpha = 0.7
+    alpha = 0.3
     loss = alpha * per_token_loss + (1 - alpha) * per_seq_loss
 
     # print(f"loss:{loss}")

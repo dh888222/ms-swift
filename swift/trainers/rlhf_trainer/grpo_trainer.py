@@ -596,11 +596,11 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                     del state_dict
         else:
             for name, param in self.model.named_parameters():
+                # 跳过additional_mlp及其子模块
+                if name.startswith("additional_mlp.") or name == "additional_mlp":
+                    continue
                 with gather_if_zero3([param]):
                     if self.vllm_mode == 'server' and self.accelerator.is_main_process:
-                        # 跳过additional_mlp及其子模块
-                        if name.startswith("additional_mlp.") or name == "additional_mlp":
-                            continue
                         self.vllm_client.update_named_param(name, param.data)
                     elif self.vllm_mode == 'colocate':
                         llm_model = self.engine.inner_model
@@ -611,6 +611,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         elif self.vllm_mode == 'colocate':
             # since vLLM model weights has been updated, we should reset the prefix cache
             self.engine.engine.reset_prefix_cache()
+        # print("self.engine.inner_model:", self.engine.inner_model)
 
     def _wait_queue(self):
         while self._queue.empty():
@@ -1332,28 +1333,41 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # 计算每个时间步的隐式奖励加权平均 \hat{r}_{implicit}(y_{i,t} | x, y_{i,<t})
             # 对应公式(1): [batch_size, seq_len]
             # =====================================================================
-            # 创建时间索引 [batch_size, seq_len]
-            t_indices = torch.arange(seq_len, device=device).expand(batch_size, seq_len)
+            # 创建递归系数矩阵 [seq_len, seq_len]
+            time_diff = torch.arange(seq_len, device=device).view(-1, 1) - torch.arange(seq_len, device=device)
+            gamma_powers = gamma ** time_diff.float().clamp(min=0)  # [seq_len, seq_len]
 
-            # 计算每个位置到序列末尾的距离 [batch_size, seq_len]
-            seq_lengths = completion_mask.sum(dim=1, keepdim=True)  # [batch_size, 1]
-            distance_to_end = (seq_lengths - 1) - t_indices  # [batch_size, seq_len]
+            # 应用eta截断
+            gamma_powers = torch.where(gamma_powers < eta, eta, gamma_powers)
 
-            # 计算基础权重 [batch_size, seq_len]
-            raw_weights = gamma ** distance_to_end.float().clamp(min=0)  # 确保距离非负
-            weights = torch.maximum(raw_weights, torch.tensor(eta, device=device))
+            # 创建正确的下三角掩码 [seq_len, seq_len]
+            tril_mask = torch.tril(torch.ones(seq_len, seq_len, device=device))  # 下三角矩阵
 
-            # 应用完成掩码 [batch_size, seq_len]
-            weights = weights * completion_mask.float()
+            # 创建三维掩码 [batch_size, seq_len, seq_len]
+            # 1. 序列有效性掩码（k位置有效）
+            mask_k = completion_mask.unsqueeze(1).float()  # [batch_size, 1, seq_len]
+            # 2. 目标位置掩码（t位置有效）
+            mask_t = completion_mask.unsqueeze(2).float()  # [batch_size, seq_len, 1]
+            # 3. 组合掩码：k位置有效 AND t位置有效 AND k <= t
+            mask_3d = mask_k * mask_t * tril_mask.unsqueeze(0)  # [batch_size, seq_len, seq_len]
 
-            # 计算累积权重和 [batch_size, seq_len]
-            # 使用cumsum实现高效计算
-            cum_weights = torch.cumsum(weights, dim=1)  # [batch_size, seq_len]
-            cum_weighted_rewards = torch.cumsum(weights * implicit_rewards, dim=1)  # [batch_size, seq_len]
+            # 计算权重矩阵 [batch_size, seq_len, seq_len]
+            weights_3d = gamma_powers.unsqueeze(0) * mask_3d  # [batch_size, seq_len, seq_len]
 
-            # 计算每个时间步的加权平均 [batch_size, seq_len]
-            # 添加小常数防止除零错误
-            r_hat_implicit_t = cum_weighted_rewards / cum_weights.clamp_min(1e-8)
+            # 计算累积权重 [batch_size, seq_len]
+            cum_weights = weights_3d.sum(dim=2)  # [batch_size, seq_len]
+
+            # 计算加权奖励 [batch_size, seq_len]
+            # 扩展奖励矩阵用于批处理
+            rewards_3d = implicit_rewards.unsqueeze(1).expand(-1, seq_len, -1)  # [batch_size, seq_len, seq_len]
+            weighted_rewards = (weights_3d * rewards_3d).sum(dim=2)  # [batch_size, seq_len]
+
+            # 计算加权平均 [batch_size, seq_len]
+            r_hat_implicit_t = weighted_rewards / cum_weights.clamp_min(1e-8)
+
+            # 应用完成掩码，确保无效位置为0
+            r_hat_implicit_t = r_hat_implicit_t * completion_mask.float()
+            # print(f'r_hat_implicit_t[...,:10]:{r_hat_implicit_t[...,:10]}')
 
             # =====================================================================
             # 计算序列级隐式奖励 r_implicit(x,y_i) 
@@ -1370,7 +1384,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # =====================================================================
             # 计算MSE损失 L_R(θ)
             # =====================================================================
-            mse_loss = torch.mean((implicit_rewards - verifier_rewards.unsqueeze(1)) ** 2)
+            mse_loss = torch.mean((r_hat_implicit_t - verifier_rewards.unsqueeze(1)) ** 2)
 
             # =====================================================================
             # 计算全局GSPO优势 \hat{A}^{GSPO}_i 
@@ -1395,8 +1409,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # 利用广播机制，避免创建大型中间张量
             per_token_advantages = torch.where(
                 expanded_A_i >= 0,  # 条件
-                r_hat_implicit_t_detached.detach() * expanded_A_i,  # A_i>=0时的计算
-                (1 - r_hat_implicit_t_detached.detach()) * expanded_A_i  # A_i<0时的计算
+                r_hat_implicit_t_detached * expanded_A_i,  # A_i>=0时的计算
+                (1 - r_hat_implicit_t_detached) * expanded_A_i  # A_i<0时的计算
             )
 
             # 应用完成掩码
