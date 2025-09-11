@@ -208,6 +208,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
 
         self.shift_k = args.shift_k
+        self.shift_gamma = args.shift_gamma
+        self.shift_alpha = args.shift_alpha
 
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
@@ -1280,10 +1282,10 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if self.importance_sampling_level == 'implicit_reward':
             per_token_logps, entropies, implicit_rewards = self._get_per_token_logps_and_entropies(
-                model, inputs, compute_entropy=self.compute_entropy, implicit_reward=True, shift_k=shift_k)
+                model, inputs, compute_entropy=self.compute_entropy, implicit_reward=True)
         else:
             per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-                model, inputs, compute_entropy=self.compute_entropy, shift_k=shift_k)
+                model, inputs, compute_entropy=self.compute_entropy)
 
         # 如果开启shift_k，拆开
         if (shift_k > 0):
@@ -1478,7 +1480,6 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # per_token_logps [B,Seq]
         # 添加shift_k损失（k=1到K）
         if shift_k > 0:
-            gamma = 0.2
             K = shift_k  # 获取K值
             device = shift_k_per_token_logps.device
             
@@ -1521,7 +1522,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 per_token_loss_shift = per_token_loss_shift + self.beta * per_token_kl.unsqueeze(1)
             
             # 应用gamma^k权重并聚合
-            gamma_weights = (gamma ** torch.arange(1, K+1, device=device)).view(1, K, 1)  # k从1开始
+            gamma_weights = (self.shift_gamma ** torch.arange(1, K+1, device=device)).view(1, K, 1)  # k从1开始
             per_token_loss_shift = per_token_loss_shift * gamma_weights  # 取k>=1部分
             valid_mask_shift = shift_k_mask & completion_mask.unsqueeze(1)  # 有效位置掩码
             
@@ -1539,7 +1540,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 loss_shift = total_loss_shift / (per_token_loss_shift.size(0) * K * self.max_completion_length)
             self._metrics[mode]['loss_shift/loss_shift'].append(loss_shift.item())
             self._metrics[mode]['loss_origin/loss_shift'].append(loss.item())
-            loss += loss_shift
+            loss = self.shift_alpha * loss_shift + (1 - self.shift_alpha) * loss
         
         if self.importance_sampling_level == 'implicit_reward':
             alpha = 1
@@ -1692,7 +1693,6 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                                            model,
                                            inputs,
                                            implicit_reward=False, # Make the output is full of logits Tensor with shape of [batch,seq_len,vocab]
-                                           shift_k=0,
                                            compute_entropy=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         logits_to_keep = inputs['logits_to_keep']
         input_ids = inputs['input_ids']
@@ -1706,7 +1706,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         can_use_super = (not unwrapped_model.model_meta.is_multimodal and 'logits_to_keep' in parameters
                          and not use_local_entropy)
 
-        if can_use_super and shift_k == 0:
+        if can_use_super and self.shift_k == 0:
             # save memory
             with self.padding_free_context(model):
                 if hasattr(super(), '_get_per_token_logps_and_entropies'):
@@ -1744,8 +1744,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             logits = logits / self.temperature
             input_ids = input_ids[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
-            if shift_k > 0:
-                shift_logps = self.multi_shift_log_softmax(logits, input_ids, shift_k)
+            if self.shift_k > 0:
+                shift_logps = self.multi_shift_log_softmax(logits, input_ids, self.shift_k)
                 # print(f'shift_logps in logits produce:{shift_logps.shape}')
                 # 扩展 tensor2 的维度：在中间插入一个维度 -> [B, 1, D]
                 logps_expanded = logps.unsqueeze(1)

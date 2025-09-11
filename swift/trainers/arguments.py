@@ -246,6 +246,8 @@ class VllmArguments:
 @dataclass
 class GRPOArgumentsMixin(VllmArguments):
     shift_k: int = 0
+    shift_gamma: float = 0.9
+    shift_alpha: float = 0.1
 
     epsilon: float = 0.2
     epsilon_high: Optional[float] = None
