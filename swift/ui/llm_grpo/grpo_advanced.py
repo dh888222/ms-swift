@@ -31,6 +31,12 @@ class GrpoAdvanced(BaseUI):
                 'en': 'Clip coefficient'
             }
         },
+        'shift_k': {
+            'label': {
+                'zh': '未来k个token的数量',
+                'en': 'Number of shift k'
+            }
+        }
         'epsilon_high': {
             'label': {
                 'zh': 'Upper clip系数',

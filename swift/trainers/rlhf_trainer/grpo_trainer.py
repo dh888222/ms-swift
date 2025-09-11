@@ -207,6 +207,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
 
+        self.shift_k = args.shift_k
+
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
 
@@ -875,23 +877,25 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
     def _fast_infer(self, inputs: InputsType) -> Tuple[InputsType, OutputsType]:
         # Skip the first wake_up to avoid the warning "Executor is not sleeping"
 
-        if self.vllm_mode == 'colocate' and self.args.sleep_level > 0:
-            if self.engine.inner_model_executor.is_sleeping:
-                # First, load weights only, https://github.com/vllm-project/vllm/pull/15500
-                if 'tags' in inspect.signature(self.engine.engine.wake_up).parameters:
-                    self.engine.engine.wake_up(tags=['weights'])
-                else:
-                    logger.info('We recommend installing vLLM >= 0.8.3, (ideally 0.8.5.post1)'
-                                'to help reduce memory peaks during engine wake-up.')
-                    self.engine.engine.wake_up()
-
-        # First, have main process load weights if needed
-        if self.state.global_step != self._last_loaded_step:
-            self._move_model_to_vllm()
-            self._last_loaded_step = self.state.global_step
-
         context = self.offload_context if self.enable_offload else nullcontext
+
         with context():
+            # Move here to fixed oom.
+            if self.vllm_mode == 'colocate' and self.args.sleep_level > 0:
+                if self.engine.inner_model_executor.is_sleeping:
+                    # First, load weights only, https://github.com/vllm-project/vllm/pull/15500
+                    if 'tags' in inspect.signature(self.engine.engine.wake_up).parameters:
+                        self.engine.engine.wake_up(tags=['weights'])
+                    else:
+                        logger.info('We recommend installing vLLM >= 0.8.3, (ideally 0.8.5.post1)'
+                                    'to help reduce memory peaks during engine wake-up.')
+                        self.engine.engine.wake_up()
+
+            # First, have main process load weights if needed
+            if self.state.global_step != self._last_loaded_step:
+                self._move_model_to_vllm()
+                self._last_loaded_step = self.state.global_step
+
             if self.vllm_mode == 'colocate' and self.engine.inner_model_executor.is_sleeping and \
                     'tags' in inspect.signature(self.engine.engine.wake_up).parameters:
                 # Load the kv_cache only after updating and offload the weights.
@@ -1268,6 +1272,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             return self._compute_loss(model, inputs)
 
     def _compute_loss(self, model, inputs):
+        shift_k = self.shift_k
         mode = 'train' if self.model.training else 'eval'
 
         completion_mask = inputs['completion_mask']
@@ -1275,10 +1280,17 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if self.importance_sampling_level == 'implicit_reward':
             per_token_logps, entropies, implicit_rewards = self._get_per_token_logps_and_entropies(
-                model, inputs, compute_entropy=self.compute_entropy, implicit_reward=True)
+                model, inputs, compute_entropy=self.compute_entropy, implicit_reward=True, shift_k=shift_k)
         else:
             per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-                model, inputs, compute_entropy=self.compute_entropy)
+                model, inputs, compute_entropy=self.compute_entropy, shift_k=shift_k)
+
+        # 如果开启shift_k，拆开
+        if (shift_k > 0):
+            # print(f"per_token_logps.shape: {per_token_logps.shape}")
+            shift_k_per_token_logps = per_token_logps[:,1:,:]
+            per_token_logps = per_token_logps[:,0,:]
+            # print(f"shift_k result, shift_k_per_token_logps.shape:{shift_k_per_token_logps.shape}, per_token_logps.shape:{per_token_logps.shape}")
 
         entropy_mask = None
         if self.compute_entropy:
@@ -1416,14 +1428,15 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # 应用完成掩码
             per_token_advantages = per_token_advantages * completion_mask.float()
             advantages = per_token_advantages.detach()
-            
+        
+
         log_ratio = per_token_logps - old_per_token_logps # [batch, seq_len]
         if self.importance_sampling_level == 'token':
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == 'sequence':
             log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
             log_importance_weights = log_importance_weights.unsqueeze(-1)
-        elif self.importance_sampling_level == 'sequence_token' or self.importance_sampling_level == 'implicit_reward':
+        elif self.importance_sampling_level in ['sequence_token', 'implicit_reward']:
             # GSPO-token: sg[si(θ)] * πθ(yi,t)/sg[πθ(yi,t)]
             seq_level_log_weight = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
             seq_level_log_weight = seq_level_log_weight.detach().unsqueeze(-1)  # Stop gradient
@@ -1460,6 +1473,73 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
+
+        # shift_k_per_token_logps:[B,K,Seq] with only Seq-K avalible, [B,K,-(K+1):] is nan
+        # per_token_logps [B,Seq]
+        # 添加shift_k损失（k=1到K）
+        if shift_k > 0:
+            gamma = 0.2
+            K = shift_k  # 获取K值
+            device = shift_k_per_token_logps.device
+            
+
+            # 修改1：直接使用 ~isnan 创建掩码，避免手动计算错误
+            shift_k_mask = ~torch.isnan(shift_k_per_token_logps)  # 自动处理所有K的有效位置
+            shift_k_logps = torch.nan_to_num(shift_k_per_token_logps, nan=0.0)
+            
+            # 计算每个k的log_ratio，假设是on_policy的
+            log_ratio_shift = shift_k_logps - shift_k_logps.detach()
+            
+            # 根据importance_sampling_level计算log_importance_weights
+            if self.importance_sampling_level == 'token':
+                log_importance_weights_shift = log_ratio_shift
+            elif self.importance_sampling_level == 'sequence':
+                seq_mask_shift = completion_mask.unsqueeze(1) & shift_k_mask
+                log_importance_weights_shift = (log_ratio_shift * seq_mask_shift).sum(-1) / seq_mask_shift.sum(-1).clamp(min=1.0)
+                log_importance_weights_shift = log_importance_weights_shift.unsqueeze(-1)
+            elif self.importance_sampling_level in ['sequence_token', 'implicit_reward']:
+                seq_mask_shift = completion_mask.unsqueeze(1) & shift_k_mask
+                seq_level_log_weight = (log_ratio_shift * seq_mask_shift).sum(-1) / seq_mask_shift.sum(-1).clamp(min=1.0)
+                seq_level_log_weight = seq_level_log_weight.detach().unsqueeze(-1)
+                log_importance_weights_shift = shift_k_logps - shift_k_logps.detach() + seq_level_log_weight
+            else:
+                raise ValueError(f"Unknown importance sampling level: {self.importance_sampling_level}")
+            
+            # 计算每个k的PPO损失
+            coef_1_shift = torch.exp(log_importance_weights_shift)
+            coef_2_shift = torch.clamp(coef_1_shift, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            if self.args.delta is not None:
+                coef_1_shift = torch.clamp(coef_1_shift, max=self.args.delta)
+            
+            per_token_loss1_shift = coef_1_shift * advantages.unsqueeze(1)
+            per_token_loss2_shift = coef_2_shift * advantages.unsqueeze(1)
+            per_token_loss_shift = -torch.min(per_token_loss1_shift, per_token_loss2_shift)
+            
+            if entropy_mask is not None:
+                per_token_loss_shift = per_token_loss_shift * entropy_mask.unsqueeze(1)
+            if self.beta != 0.0:
+                per_token_loss_shift = per_token_loss_shift + self.beta * per_token_kl.unsqueeze(1)
+            
+            # 应用gamma^k权重并聚合
+            gamma_weights = (gamma ** torch.arange(1, K+1, device=device)).view(1, K, 1)  # k从1开始
+            per_token_loss_shift = per_token_loss_shift * gamma_weights  # 取k>=1部分
+            valid_mask_shift = shift_k_mask & completion_mask.unsqueeze(1)  # 有效位置掩码
+            
+            if self.loss_type == 'grpo':
+                # 每个样本每个k的平均损失
+                loss_shift_per_k = (per_token_loss_shift * valid_mask_shift).sum(-1) / valid_mask_shift.sum(-1).clamp(min=1.0)
+                loss_shift = loss_shift_per_k.mean()  # 先平均token再平均batch和k
+            elif self.loss_type == 'bnpo':
+                # 所有有效token的全局平均
+                total_loss_shift = (per_token_loss_shift * valid_mask_shift).sum()
+                total_valid = valid_mask_shift.sum().clamp(min=1.0)
+                loss_shift = total_loss_shift / total_valid
+            elif self.loss_type == 'dr_grpo':
+                total_loss_shift = (per_token_loss_shift * valid_mask_shift).sum()
+                loss_shift = total_loss_shift / (per_token_loss_shift.size(0) * K * self.max_completion_length)
+            self._metrics[mode]['loss_shift/loss_shift'].append(loss_shift.item())
+            self._metrics[mode]['loss_origin/loss_shift'].append(loss.item())
+            loss += loss_shift
         
         if self.importance_sampling_level == 'implicit_reward':
             alpha = 1
@@ -1571,11 +1651,48 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             remove_handle1.remove()
             remove_handle2.remove()
 
+    def multi_shift_log_softmax(self, logits, input_ids, K):
+        """
+        计算多个 shift_k 的 log 概率
+        
+        参数:
+            logits: [B, S, V] 模型输出的 logits
+            input_ids: [B, S] 输入 token IDs
+            K: 最大 shift 步数
+            
+        返回:
+            all_logps: [B, K, S] 每个位置在不同 shift 下的 log 概率
+        """
+        B, S, V = logits.shape
+        # 初始化结果张量，用 NaN 填充无效位置
+        all_logps = torch.full((B, K, S), float('nan'), device=logits.device, dtype=logits.dtype)
+        
+        for k in range(1, K + 1):
+            # 检查是否有足够的上下文
+            if k > S:
+                continue  # 跳过超过序列长度的 shift
+                
+            # 将 input_ids 向左移动 k 步
+            shifted_input_ids = input_ids[:, k:]  # [B, S-k]
+            
+            # 将 logits 向右移动 k 步
+            shifted_logits = logits[:, :-k, :]  # [B, S-k, V]
+            
+            # 计算当前 shift 的 log 概率
+            logps = selective_log_softmax(shifted_logits, shifted_input_ids)  # [B, S-k]
+            
+            # 将结果填充到对应位置 (从第 0 个位置开始到 -k)
+            all_logps[:, k-1, :-k] = logps
+        
+        return all_logps
+
+
     @patch_profiling_decorator
     def _get_per_token_logps_and_entropies(self,
                                            model,
                                            inputs,
                                            implicit_reward=False, # Make the output is full of logits Tensor with shape of [batch,seq_len,vocab]
+                                           shift_k=0,
                                            compute_entropy=False) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         logits_to_keep = inputs['logits_to_keep']
         input_ids = inputs['input_ids']
@@ -1589,7 +1706,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         can_use_super = (not unwrapped_model.model_meta.is_multimodal and 'logits_to_keep' in parameters
                          and not use_local_entropy)
 
-        if can_use_super:
+        if can_use_super and shift_k == 0:
             # save memory
             with self.padding_free_context(model):
                 if hasattr(super(), '_get_per_token_logps_and_entropies'):
@@ -1627,6 +1744,15 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             logits = logits / self.temperature
             input_ids = input_ids[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
+            if shift_k > 0:
+                shift_logps = self.multi_shift_log_softmax(logits, input_ids, shift_k)
+                # print(f'shift_logps in logits produce:{shift_logps.shape}')
+                # 扩展 tensor2 的维度：在中间插入一个维度 -> [B, 1, D]
+                logps_expanded = logps.unsqueeze(1)
+
+                # 沿第 1 维拼接（K 所在的维度）
+                logps = torch.cat((logps_expanded, shift_logps), dim=1)
+
             entropies = None
             if compute_entropy:
                 entropies = entropy_from_logits(logits)
@@ -1766,7 +1892,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
     @torch.no_grad()
     def offload_model(self, model):
         for param in model.parameters():
-            param.data = param.data.to(torch.device('cpu'), non_blocking=True)
+            param.data = param.data.to(torch.device('cpu'), non_blocking=False)
 
     @torch.no_grad()
     def load_model(self, model):
@@ -1783,7 +1909,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 state = self.optimizer.state[param]
                 for key, value in state.items():
                     if isinstance(value, torch.Tensor):
-                        state[key] = value.to('cpu', non_blocking=True)
+                        state[key] = value.to('cpu', non_blocking=False)
 
     @torch.no_grad()
     def load_optimizer(self):
