@@ -1274,7 +1274,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             return self._compute_loss(model, inputs)
 
     def _compute_loss(self, model, inputs):
-        shift_k = self.shift_k
+        # print(self.shift_k)
         mode = 'train' if self.model.training else 'eval'
 
         completion_mask = inputs['completion_mask']
@@ -1286,13 +1286,6 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         else:
             per_token_logps, entropies = self._get_per_token_logps_and_entropies(
                 model, inputs, compute_entropy=self.compute_entropy)
-
-        # 如果开启shift_k，拆开
-        if (shift_k > 0):
-            # print(f"per_token_logps.shape: {per_token_logps.shape}")
-            shift_k_per_token_logps = per_token_logps[:,1:,:]
-            per_token_logps = per_token_logps[:,0,:]
-            # print(f"shift_k result, shift_k_per_token_logps.shape:{shift_k_per_token_logps.shape}, per_token_logps.shape:{per_token_logps.shape}")
 
         entropy_mask = None
         if self.compute_entropy:
@@ -1432,7 +1425,22 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             advantages = per_token_advantages.detach()
         
 
+        # 修改1：直接使用 ~isnan 创建掩码，避免手动计算错误
+        if (self.shift_k > 0):
+            shift_k_mask = ~torch.isnan(per_token_logps)[:,1:,:]  # 自动处理所有K的有效位置
+            per_token_logps = torch.nan_to_num(per_token_logps, nan=0.0)
+            shift_k_logps = per_token_logps[:,1:,:]
+            old_per_token_logps = torch.nan_to_num(old_per_token_logps, nan=0.0)
+
         log_ratio = per_token_logps - old_per_token_logps # [batch, seq_len]
+        
+        # 如果开启shift_k，拆开
+        if (self.shift_k > 0):
+            # print(f"per_token_logps.shape: {per_token_logps.shape}")
+            log_ratio_shift = log_ratio[:,1:,:] # [B,K,S]
+            log_ratio = log_ratio[:,0,:] # [B,S]
+            # print(f"shift_k result, log_ratio_shift.shape:{log_ratio_shift.shape}, log_ratio.shape:{log_ratio.shape}")
+
         if self.importance_sampling_level == 'token':
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == 'sequence':
@@ -1476,21 +1484,13 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
 
-        # shift_k_per_token_logps:[B,K,Seq] with only Seq-K avalible, [B,K,-(K+1):] is nan
+        # log_ratio_shift:[B,K,Seq] with only Seq-K avalible, [B,K,-(K+1):] is nan
         # per_token_logps [B,Seq]
         # 添加shift_k损失（k=1到K）
-        if shift_k > 0:
-            K = shift_k  # 获取K值
-            device = shift_k_per_token_logps.device
-            
-
-            # 修改1：直接使用 ~isnan 创建掩码，避免手动计算错误
-            shift_k_mask = ~torch.isnan(shift_k_per_token_logps)  # 自动处理所有K的有效位置
-            shift_k_logps = torch.nan_to_num(shift_k_per_token_logps, nan=0.0)
-            
-            # 计算每个k的log_ratio，假设是on_policy的
-            log_ratio_shift = shift_k_logps - shift_k_logps.detach()
-            
+        if self.shift_k > 0:
+            K = self.shift_k  # 获取K值
+            device = log_ratio_shift.device
+        
             # 根据importance_sampling_level计算log_importance_weights
             if self.importance_sampling_level == 'token':
                 log_importance_weights_shift = log_ratio_shift
@@ -1745,6 +1745,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             input_ids = input_ids[:, -logits_to_keep:]
             logps = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
             if self.shift_k > 0:
+                # shift_logps: [B,K,S]
                 shift_logps = self.multi_shift_log_softmax(logits, input_ids, self.shift_k)
                 # print(f'shift_logps in logits produce:{shift_logps.shape}')
                 # 扩展 tensor2 的维度：在中间插入一个维度 -> [B, 1, D]
