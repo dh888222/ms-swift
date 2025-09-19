@@ -207,6 +207,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
 
+        self.batch_advantage_beta = args.batch_advantage_beta
+
         self.shift_k = args.shift_k
         self.shift_gamma = args.shift_gamma
         self.shift_alpha = args.shift_alpha
@@ -1132,8 +1134,17 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         std_grouped_rewards = grouped_rewards.std(dim=1).repeat_interleave(self.num_generations, dim=0)
 
         advantages = (rewards - mean_grouped_rewards)
+
         if self.args.scale_rewards:
             advantages /= (std_grouped_rewards + 1e-4)
+            
+        # 批次级标准化
+        if self.batch_advantage_beta > 0:
+            batch_mean = rewards.mean()
+            batch_std = rewards.std()
+            batch_advantages = (rewards - batch_mean) / (batch_std + 1e-4)
+            advantages = (1 - self.batch_advantage_beta) * advantages + self.batch_advantage_beta * batch_advantages
+        
         self._logs['advantages'].extend(gather(advantages).tolist())
         if any('images' in data and data['images'] is not None for data in inputs):
             self._logs['image'].extend(gather_object([inp['images'] for inp in inputs]))

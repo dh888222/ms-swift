@@ -245,6 +245,8 @@ class VllmArguments:
 
 @dataclass
 class GRPOArgumentsMixin(VllmArguments):
+    batch_advantage_beta: float = 0.0
+
     shift_k: int = 0
     shift_gamma: float = 0.9
     shift_alpha: float = 0.1
