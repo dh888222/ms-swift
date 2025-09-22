@@ -1552,6 +1552,41 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self._metrics[mode]['loss_shift/loss_shift'].append(loss_shift.item())
             self._metrics[mode]['loss_origin/loss_shift'].append(loss.item())
             loss = self.shift_alpha * loss_shift + (1 - self.shift_alpha) * loss
+
+            def masked_batch_mean(tensor, mask):
+                return (tensor * mask).sum() / mask.sum().clamp(min=1.0)
+            # 在shift loss计算后添加以下代码（在记录loss_shift.item()之后）
+            # 计算shift部分的clip indicators
+            with torch.no_grad():
+                # 扩展advantages以匹配shift的维度 [B, K, Seq]
+                advantages_shift = advantages.unsqueeze(1)
+                
+                # 计算clip条件
+                is_low_clipped_shift = (coef_1_shift < 1 - self.epsilon_low) & (advantages_shift < 0)
+                is_high_clipped_shift = (coef_1_shift > 1 + self.epsilon_high) & (advantages_shift > 0)
+                is_region_clipped_shift = is_low_clipped_shift | is_high_clipped_shift
+                
+                # 应用有效掩码
+                valid_mask_shift = shift_k_mask & completion_mask.unsqueeze(1)
+                
+                # 计算各clip比例
+                low_clip_shift = masked_batch_mean(is_low_clipped_shift.float(), valid_mask_shift)
+                high_clip_shift = masked_batch_mean(is_high_clipped_shift.float(), valid_mask_shift)
+                clip_ratio_shift = masked_batch_mean(is_region_clipped_shift.float(), valid_mask_shift)
+
+            # 收集并记录指标
+            gathered_low_clip_shift = self.accelerator.gather_for_metrics(low_clip_shift)
+            self._metrics[mode]['clip_ratio_shift/low_mean'].append(gathered_low_clip_shift.nanmean().item())
+            self._metrics[mode]['clip_ratio_shift/low_min'].append(nanmin(gathered_low_clip_shift).item())
+
+            gathered_high_clip_shift = self.accelerator.gather_for_metrics(high_clip_shift)
+            self._metrics[mode]['clip_ratio_shift/high_mean'].append(gathered_high_clip_shift.nanmean().item())
+            self._metrics[mode]['clip_ratio_shift/high_max'].append(nanmax(gathered_high_clip_shift).item())
+
+            gathered_clip_ratio_shift = self.accelerator.gather_for_metrics(clip_ratio_shift)
+            self._metrics[mode]['clip_ratio_shift/region_mean'].append(gathered_clip_ratio_shift.nanmean().item())
+
+
         
         if self.importance_sampling_level == 'implicit_reward':
             alpha = 1
