@@ -1144,6 +1144,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             batch_std = rewards.std()
             batch_advantages = (rewards - batch_mean) / (batch_std + 1e-4)
             advantages = (1 - self.batch_advantage_beta) * advantages + self.batch_advantage_beta * batch_advantages
+            advantages_std = advantages.std()
+            advantages = advantages / (advantages_std + 1e-4)
         
         self._logs['advantages'].extend(gather(advantages).tolist())
         if any('images' in data and data['images'] is not None for data in inputs):
